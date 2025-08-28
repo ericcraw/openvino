@@ -102,6 +102,41 @@ std::optional<size_t> determine_dynamic_batch_size(const IODescriptor& desc,
 
 }  // namespace
 
+class ImportedZeroTensors {
+    mutable std::mutex mutex;
+    std::map<uint64_t, std::weak_ptr<ZeroTensor>> imported_tensors;
+
+public:
+    static ImportedZeroTensors& Get() {
+        static ImportedZeroTensors instance;
+        return instance;
+    }
+
+    std::shared_ptr<ZeroTensor> GetTensor(uint64_t id) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto iter = imported_tensors.find(id);
+        if (iter != imported_tensors.end()) {
+            return iter->second.lock();
+        }
+        return nullptr;
+    }
+    void AddTensor(uint64_t id, std::shared_ptr<ZeroTensor> tensor) {
+        std::lock_guard<std::mutex> lock(mutex);
+        imported_tensors[id] = tensor;
+    }
+
+    void Trim() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto iter = imported_tensors.begin(); iter != imported_tensors.end();) {
+            if (iter->second.expired()) {
+                iter = imported_tensors.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+    }
+};
+
 //------------------------------------------------------------------------------
 ZeroInferRequest::ZeroInferRequest(const std::shared_ptr<ZeroInitStructsHolder>& initStructs,
                                    const std::shared_ptr<const ICompiledModel>& compiledModel,
@@ -278,6 +313,9 @@ void ZeroInferRequest::create_pipeline() {
                     std::dynamic_pointer_cast<ZeroTensor>(levelZeroInput)->set_tensor_shared_with_user();
 
                     levelZeroOutput = levelZeroInput;
+                    ImportedZeroTensors::Get().AddTensor(
+                        zeroUtils::get_l0_memory_id(_initStructs->getContext(), levelZeroInput->data()),
+                        std::static_pointer_cast<ZeroTensor>(levelZeroInput));
 
                     zeroState->reset_tensor_imported_flag();
                 } else {
@@ -312,14 +350,23 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
     bool updateCommandListArg = false;
 
     OV_ITT_TASK_NEXT(ZERO_SET_TENSOR, "check_data_allocation");
-    if (zeroUtils::memory_was_allocated_in_the_same_l0_context(_initStructs->getContext(), tensor->data())) {
+    uint64_t id = zeroUtils::get_l0_memory_id(_initStructs->getContext(), tensor->data());
+    bool memory_from_l0_context = id != 0;
+
+    if (memory_from_l0_context) {
         _logger.debug("ZeroInferRequest::set_tensor_data - tensor was created in the same L0 context, size: %zu",
                       tensor->get_byte_size());
-        levelZeroTensors = tensor;
 
-        auto zero_tensor = std::dynamic_pointer_cast<ZeroTensor>(levelZeroTensors);
+        auto zero_tensor = std::dynamic_pointer_cast<ZeroTensor>(tensor);
         if (zero_tensor != nullptr) {
             zero_tensor->set_tensor_shared_with_user();
+        }
+
+        auto imported_tensor = ImportedZeroTensors::Get().GetTensor(id);
+        if (imported_tensor) {
+            levelZeroTensors = std::shared_ptr<ov::ITensor>(imported_tensor, tensor.get());
+        } else {
+            levelZeroTensors = tensor;
         }
 
         updateCommandListArg = true;
@@ -336,6 +383,9 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
                                                             tensor->get_element_type(),
                                                             tensor->get_shape(),
                                                             hostMemSharedAllocator);
+            ImportedZeroTensors::Get().AddTensor(
+                zeroUtils::get_l0_memory_id(_initStructs->getContext(), levelZeroTensors->data()),
+                std::static_pointer_cast<ZeroTensor>(levelZeroTensors));
 
             std::dynamic_pointer_cast<ZeroTensor>(levelZeroTensors)->set_tensor_shared_with_user();
 
@@ -549,12 +599,16 @@ void ZeroInferRequest::set_tensors(const ov::Output<const ov::Node>& port,
                             zeroMemory::HostMemSharedAllocator(_initStructs,
                                                                tensors.at(i)._ptr,
                                                                ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED);
-                        get_level_zero_input(foundPort.idx, i) =
-                            std::make_shared<ZeroTensor>(_initStructs,
-                                                         _config,
-                                                         tensors.at(i)->get_element_type(),
-                                                         tensors.at(i)->get_shape(),
-                                                         hostMemSharedAllocator);
+                        auto levelZeroTensor = std::make_shared<ZeroTensor>(_initStructs,
+                                                                            _config,
+                                                                            tensors.at(i)->get_element_type(),
+                                                                            tensors.at(i)->get_shape(),
+                                                                            hostMemSharedAllocator);
+                        get_level_zero_input(foundPort.idx, i) = levelZeroTensor;
+
+                        ImportedZeroTensors::Get().AddTensor(
+                            zeroUtils::get_l0_memory_id(_initStructs->getContext(), levelZeroTensor->data()),
+                            std::static_pointer_cast<ZeroTensor>(levelZeroTensor));
 
                         levelZeroTensorCreated = true;
                     }
@@ -749,6 +803,10 @@ void ZeroInferRequest::update_states_if_memory_changed() {
                                                                   userInput->get_element_type(),
                                                                   userInput->get_shape(),
                                                                   hostMemSharedAllocator);
+
+                    ImportedZeroTensors::Get().AddTensor(
+                        zeroUtils::get_l0_memory_id(_initStructs->getContext(), levelZeroInput->data()),
+                        std::static_pointer_cast<ZeroTensor>(levelZeroInput));
 
                     std::dynamic_pointer_cast<ZeroTensor>(levelZeroInput)->set_tensor_shared_with_user();
 

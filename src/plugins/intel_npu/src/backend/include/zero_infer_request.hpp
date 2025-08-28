@@ -90,7 +90,7 @@ private:
 
     bool _pipelineIsCreated = false;
     bool _dynamicBatchValueChanged = false;
-    bool _externalMemoryStandardAllocationSupported = false;
+    bool _externalMemoryStandardAllocationSupported = true;
 };
 
 }  //  namespace intel_npu
