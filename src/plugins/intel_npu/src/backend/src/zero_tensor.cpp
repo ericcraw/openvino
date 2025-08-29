@@ -39,13 +39,38 @@ ZeroTensor::ZeroTensor(const std::shared_ptr<ZeroInitStructsHolder>& init_struct
     OPENVINO_ASSERT(_element_type.is_static());
     OPENVINO_ASSERT(allocator, "Allocator was not initialized");
     const auto byte_size = ov::element::get_memory_size(_element_type, shape_size(_shape));
-    auto data = const_cast<ov::Allocator&>(_allocator).allocate(byte_size);
+    auto data = const_cast<ov::Allocator&>(*_allocator).allocate(byte_size);
     OPENVINO_ASSERT(byte_size == 0 || data != nullptr, "Failed to allocate memory");
     initialize_elements(data, element_type, _shape);
     _ptr = data;
 }
 
-// Note: Override data() members to not used OpenVINO library code to improve performance
+ZeroTensor::ZeroTensor(std::shared_ptr<ZeroTensor> other,
+                       size_t offset,
+                       const ov::element::Type element_type,
+                       const ov::Shape& shape)
+    : _init_structs(other->_init_structs),
+      _logger("ZeroTensor", other->_logger.level()),
+      _element_type{element_type},
+      _shape{shape},
+      _capacity{_shape},
+      _strides{},
+      _strides_once{},
+      _allocator{} {
+    OPENVINO_ASSERT(_element_type.is_static());
+    OPENVINO_ASSERT(element_type != ov::element::Type_t::string, "String tensors are not supported");
+    const auto other_size = ov::element::get_memory_size(other->_element_type, shape_size(other->_shape));
+    const auto byte_size = ov::element::get_memory_size(_element_type, shape_size(_shape));
+    OPENVINO_ASSERT(offset <= std::numeric_limits<size_t>::max() - byte_size,
+                    "Offset and byte_size addition would overflow");
+    OPENVINO_ASSERT(offset + byte_size <= other_size, "invalid offset");
+
+    OPENVINO_ASSERT(byte_size == 0 || other->_ptr != nullptr, "Failed to access memory");
+    _ptr = static_cast<void*>(static_cast<char*>(other->_ptr) + offset);
+    _shared_tensor = other;
+}
+
+// Note: Override data() members to not used OpenVINO library code to improve   performance
 void* ZeroTensor::data() {
     return _ptr;
 }
@@ -133,8 +158,10 @@ void ZeroTensor::destroy_elements(size_t begin_ind, size_t end_ind) {
 }
 
 void ZeroTensor::destroy_memory() {
-    destroy_elements(0, get_capacity());
-    _allocator.deallocate(_ptr, get_bytes_capacity());
+    if (_allocator) {
+        destroy_elements(0, get_capacity());
+        _allocator->deallocate(_ptr, get_bytes_capacity());
+    }
     _ptr = nullptr;
 }
 
@@ -146,6 +173,7 @@ void ZeroTensor::set_shape(ov::Shape new_shape) {
     _shape = std::move(new_shape);
 
     if (get_size() > get_capacity()) {
+        OPENVINO_ASSERT(_allocator, "View zero tensors can't be resized to larger shapes");
         if (_init_structs->getMutableCommandListExtVersion() < ZE_MAKE_VERSION(1, 0)) {
             OPENVINO_THROW("Re-shaping the tensor with a larger shape is not available using this driver version. "
                            "Please update the driver to the latest version.");
@@ -155,7 +183,7 @@ void ZeroTensor::set_shape(ov::Shape new_shape) {
 
         // allocate buffer and initialize objects from scratch
         _capacity = _shape;
-        _ptr = _allocator.allocate(get_bytes_capacity());
+        _ptr = _allocator->allocate(get_bytes_capacity());
         initialize_elements(_ptr, _element_type, _shape);
 
         _reset_tensor_memory = true;

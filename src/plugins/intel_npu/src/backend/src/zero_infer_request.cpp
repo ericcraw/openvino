@@ -354,7 +354,8 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
     bool memory_from_l0_context = id != 0;
 
     if (memory_from_l0_context) {
-        _logger.debug("ZeroInferRequest::set_tensor_data - tensor was created in the same L0 context, size: %zu",
+        _logger.debug("%p ZeroInferRequest::set_tensor_data - tensor was created in the same L0 context, size: %zu",
+                      this,
                       tensor->get_byte_size());
 
         auto zero_tensor = std::dynamic_pointer_cast<ZeroTensor>(tensor);
@@ -364,8 +365,19 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
 
         auto imported_tensor = ImportedZeroTensors::Get().GetTensor(id);
         if (imported_tensor) {
-            levelZeroTensors = std::shared_ptr<ov::ITensor>(imported_tensor, tensor.get());
+            _logger.debug("%p ZeroInferRequest::set_tensor_data - using imported tensor %p, user data: %p",
+                          this,
+                          imported_tensor->data(),
+                          tensor->data());
+            auto base = reinterpret_cast<std::uintptr_t>(imported_tensor->data());
+            auto ptr = reinterpret_cast<std::uintptr_t>(tensor->data());
+            std::uintptr_t offset = ptr - base;
+
+            levelZeroTensors =
+                std::make_shared<ZeroTensor>(imported_tensor, offset, tensor->get_element_type(), tensor->get_shape());
         } else {
+            void* data_ptr = zero_tensor != nullptr ? zero_tensor->data() : tensor->data();
+            _logger.debug("%p ZeroInferRequest::set_tensor_data - using tensor, data: %p", this, data_ptr);
             levelZeroTensors = tensor;
         }
 
@@ -373,21 +385,34 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
     } else {
         if (_externalMemoryStandardAllocationSupported &&
             utils::memory_and_size_aligned_to_standard_page_size(tensor->data(), tensor->get_byte_size())) {
-            _logger.debug("ZeroInferRequest::set_tensor_data - import memory from a system memory pointer");
+            _logger.debug(
+                "%p ZeroInferRequest::set_tensor_data - import memory from a system memory pointer, size: %zu",
+                this,
+                tensor->get_byte_size());
+
             auto hostMemSharedAllocator =
                 zeroMemory::HostMemSharedAllocator(_initStructs,
                                                    tensor,
                                                    isInput ? ZE_HOST_MEM_ALLOC_FLAG_BIAS_WRITE_COMBINED : 0);
-            levelZeroTensors = std::make_shared<ZeroTensor>(_initStructs,
-                                                            _config,
-                                                            tensor->get_element_type(),
-                                                            tensor->get_shape(),
-                                                            hostMemSharedAllocator);
-            ImportedZeroTensors::Get().AddTensor(
-                zeroUtils::get_l0_memory_id(_initStructs->getContext(), levelZeroTensors->data()),
-                std::static_pointer_cast<ZeroTensor>(levelZeroTensors));
 
-            std::dynamic_pointer_cast<ZeroTensor>(levelZeroTensors)->set_tensor_shared_with_user();
+            // create into a temporary so we can log its data ptr before assigning to levelZeroTensors
+            auto created_zero_tensor = std::make_shared<ZeroTensor>(_initStructs,
+                                                                    _config,
+                                                                    tensor->get_element_type(),
+                                                                    tensor->get_shape(),
+                                                                    hostMemSharedAllocator);
+
+            ImportedZeroTensors::Get().AddTensor(
+                zeroUtils::get_l0_memory_id(_initStructs->getContext(), created_zero_tensor->data()),
+                std::static_pointer_cast<ZeroTensor>(created_zero_tensor));
+
+            std::dynamic_pointer_cast<ZeroTensor>(created_zero_tensor)->set_tensor_shared_with_user();
+
+            _logger.debug("%p ZeroInferRequest::set_tensor_data - created imported ZeroTensor, data: %p",
+                          this,
+                          created_zero_tensor->data());
+
+            levelZeroTensors = created_zero_tensor;
 
             updateCommandListArg = true;
         } else {
@@ -395,16 +420,23 @@ void ZeroInferRequest::set_tensor_data(const std::shared_ptr<ov::ITensor>& tenso
 
             if (_dynamicBatchValueChanged || zeroTensor == nullptr ||
                 (zeroTensor != nullptr && zeroTensor->tensor_was_shared_with_user())) {
-                _logger.debug("ZeroInferRequest::set_tensor_data - create locally L0 tensor");
                 OV_ITT_TASK_NEXT(ZERO_SET_TENSOR, "allocate tensor");
 
                 auto batch = _graph->get_batch_size();
 
-                levelZeroTensors = allocate_tensor(isInput ? _metadata.inputs.at(index) : _metadata.outputs.at(index),
-                                                   index,
-                                                   isInput,
-                                                   isInput ? *_inputAllocator : *_outputAllocator,
-                                                   batch);
+                // allocate into temp so we can log its data ptr before assigning
+                auto new_level_zero =
+                    allocate_tensor(isInput ? _metadata.inputs.at(index) : _metadata.outputs.at(index),
+                                    index,
+                                    isInput,
+                                    isInput ? *_inputAllocator : *_outputAllocator,
+                                    batch);
+
+                _logger.debug("%p ZeroInferRequest::set_tensor_data - create locally L0 tensor %p",
+                              this,
+                              new_level_zero->data());
+
+                levelZeroTensors = new_level_zero;
 
                 updateCommandListArg = true;
             }

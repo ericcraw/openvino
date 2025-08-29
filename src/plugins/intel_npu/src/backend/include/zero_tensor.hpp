@@ -28,6 +28,10 @@ public:
                const ov::element::Type element_type,
                const ov::Shape& shape,
                const ov::Allocator& allocator);
+    ZeroTensor(std::shared_ptr<ZeroTensor> other,
+               size_t offset,
+               const ov::element::Type element_type,
+               const ov::Shape& shape);
 
     void* data() override;
     void* data(const ov::element::Type& type) override;
@@ -50,6 +54,8 @@ public:
     void set_tensor_shared_with_user();
 
     ~ZeroTensor();
+    std::mutex _user_tensors_mutex;
+    std::set<std::shared_ptr<ov::ITensor>> _user_tensors;
 
 private:
     static void initialize_elements(void* data, const ov::element::Type& element_type, const ov::Shape& shape);
@@ -67,10 +73,11 @@ private:
     ov::Shape _capacity;
     mutable ov::Strides _strides;
     mutable std::once_flag _strides_once;
-    ov::Allocator _allocator;
+    std::optional<ov::Allocator> _allocator;
     void* _ptr = nullptr;
     bool _reset_tensor_memory = false;
     bool _tensor_shared_with_user = false;
+    std::shared_ptr<ZeroTensor> _shared_tensor;
 };
 
 }  // namespace intel_npu
