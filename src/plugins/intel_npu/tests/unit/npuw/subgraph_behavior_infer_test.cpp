@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <any>
 #include <atomic>
 #include <cstring>
@@ -16,7 +17,9 @@
 #define private public
 #include "compiled_model.hpp"
 #undef private
+#define protected public
 #include "just_sync_infer_request.hpp"
+#undef protected
 #include "llm_test_helpers.hpp"
 #include "model_builder.hpp"
 #include "partitioning/patterns/sdpa.hpp"
@@ -125,6 +128,19 @@ std::size_t count_runtime_behaviors(const std::shared_ptr<ov::npuw::CompiledMode
                          [](const auto& desc) {
                              return desc.pipeline.runtime_behavior.has_value();
                          });
+}
+
+std::vector<std::pair<std::size_t, ov::npuw::LinkFrom>> external_function_outputs(
+    const std::shared_ptr<ov::npuw::CompiledModel>& compiled_model) {
+    std::vector<std::pair<std::size_t, ov::npuw::LinkFrom>> outputs;
+    for (std::size_t output_idx = 0; output_idx < compiled_model->m_outputs_to_submodels_outputs.size(); ++output_idx) {
+        const auto& from = compiled_model->m_outputs_to_submodels_outputs[output_idx];
+        if (from != ov::npuw::CompiledModel::NO_LINK &&
+            compiled_model->m_compiled_submodels.at(from.first).replaced_by.has_value()) {
+            outputs.emplace_back(output_idx, from);
+        }
+    }
+    return outputs;
 }
 
 // Count subgraphs where the attention runtime behavior was attached.  The test keys off the
@@ -461,6 +477,85 @@ TEST_F(SubgraphBehaviorInferTest, RuntimeBehaviorForcesJustInferRequestWhenUnfol
     ASSERT_NE(behavior_request, nullptr);
     EXPECT_NE(std::dynamic_pointer_cast<ov::npuw::JustInferRequest>(behavior_request), nullptr);
     EXPECT_EQ(std::dynamic_pointer_cast<ov::npuw::UnfoldInferRequest>(behavior_request), nullptr);
+}
+
+TEST_F(SubgraphBehaviorInferTest, ExternalFunctionOutputIsResolvedLazilyFromTopLevelStorage) {
+    auto plugin = std::make_shared<TestPlugin>();
+    auto core = make_core(plugin);
+    plugin->set_core(core);
+
+    auto compiled = std::make_shared<ov::npuw::CompiledModel>(build_static_llm_model(), plugin, base_props());
+    auto request = std::dynamic_pointer_cast<ov::npuw::JustInferRequest>(compiled->create_sync_infer_request());
+    ASSERT_NE(request, nullptr);
+
+    const auto external_outputs = external_function_outputs(compiled);
+    ASSERT_FALSE(external_outputs.empty());
+    for (const auto& [output_idx, from] : external_outputs) {
+        EXPECT_EQ(request->m_funcall_result.count(from), 0u)
+            << "Top-level output " << output_idx << " was eagerly assigned function storage";
+    }
+
+    bool found_internal_output = false;
+    for (std::size_t subgraph_idx = 0; subgraph_idx < compiled->m_compiled_submodels.size(); ++subgraph_idx) {
+        const auto& desc = compiled->m_compiled_submodels[subgraph_idx];
+        if (!desc.replaced_by) {
+            continue;
+        }
+        const auto& function = compiled->m_compiled_submodels.at(desc.replaced_by.value()).compiled_model;
+        for (std::size_t output_idx = 0; output_idx < function->outputs().size(); ++output_idx) {
+            const ov::npuw::LinkFrom from{subgraph_idx, output_idx};
+            if (!request->m_external_funcall_outputs.count(from)) {
+                found_internal_output = true;
+                EXPECT_EQ(request->m_funcall_result.count(from), 1u);
+            }
+        }
+    }
+    EXPECT_TRUE(found_internal_output) << "The test model must retain an internal-only function output";
+
+    const auto& [output_idx, from] = external_outputs.front();
+    const auto& port = compiled->outputs().at(output_idx);
+    request->infer();
+
+    ASSERT_EQ(request->m_funcall_result.count(from), 1u);
+    auto top_level_tensor = request->get_tensor(port);
+    EXPECT_EQ(request->m_funcall_result.at(from)->data(), top_level_tensor->data());
+}
+
+TEST_F(SubgraphBehaviorInferTest, BoundExternalFunctionOutputIsUsedByFunctionRequest) {
+    auto plugin = std::make_shared<TestPlugin>();
+    auto core = make_core(plugin);
+    plugin->set_core(core);
+
+    auto compiled = std::make_shared<ov::npuw::CompiledModel>(build_static_llm_model(), plugin, base_props());
+    auto request = std::dynamic_pointer_cast<ov::npuw::JustInferRequest>(compiled->create_sync_infer_request());
+    ASSERT_NE(request, nullptr);
+
+    const auto external_outputs = external_function_outputs(compiled);
+    ASSERT_FALSE(external_outputs.empty());
+    const auto& [output_idx, from] = external_outputs.front();
+    const auto& port = compiled->outputs().at(output_idx);
+    const auto& input_port = compiled->inputs().front();
+    const auto input_bytes = ov::shape_size(input_port.get_shape()) * input_port.get_element_type().size();
+    const auto output_bytes = ov::shape_size(port.get_shape()) * port.get_element_type().size();
+    ov::Tensor backing_tensor(ov::element::u8, ov::Shape{std::max(input_bytes, output_bytes)});
+    auto bound_input =
+        ov::get_tensor_impl(ov::Tensor(input_port.get_element_type(), input_port.get_shape(), backing_tensor.data()));
+    auto bound_tensor = ov::get_tensor_impl(ov::Tensor(port.get_element_type(), port.get_shape(), backing_tensor.data()));
+
+    std::shared_ptr<ov::npuw::IBaseInferRequest> public_request = request;
+    public_request->set_tensor(input_port, bound_input);
+    public_request->set_tensor(port, bound_tensor);
+    ASSERT_EQ(request->m_funcall_result.count(from), 1u);
+    EXPECT_EQ(public_request->get_tensor(input_port)->data(), bound_tensor->data());
+    EXPECT_EQ(request->m_funcall_result.at(from)->data(), bound_tensor->data());
+
+    request->infer();
+
+    const auto real_idx = compiled->m_compiled_submodels.at(from.first).replaced_by.value();
+    const auto& function_port = compiled->m_compiled_submodels.at(real_idx).compiled_model->outputs().at(from.second);
+    auto function_tensor = request->get_subrequest(real_idx)->get_tensor(function_port);
+    EXPECT_EQ(function_tensor->data(), bound_tensor->data());
+    EXPECT_EQ(request->get_tensor(port)->data(), bound_tensor->data());
 }
 
 // --- Dynamic-attention behavior gating tests ---

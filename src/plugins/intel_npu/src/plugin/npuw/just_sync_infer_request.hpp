@@ -63,7 +63,7 @@ public:
 
     using AllocFcn = std::function<TensorPtr(const ov::element::Type&, const ov::Shape&, const std::string&)>;
     void set_alloc(AllocFcn&& fcn);
-    void assign_memory();
+    void assign_memory(const std::map<LinkFrom, std::size_t>& external_outputs);
 
     TensorPtr get_tensor(const LinkFrom& from);
 
@@ -108,8 +108,6 @@ protected:
     bool supports_async_pipeline() const override;
     void update_subrequest_links(std::size_t idx) override;
 
-    TensorPtr alloc_global_out(std::size_t out_idx) const override;
-
     void set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor) override;
 
     ////////////////////////////////////
@@ -142,6 +140,7 @@ protected:
 
 protected:
     void connect_subrequests();
+    void resolve_external_function_outputs();
     void initialize_subgraph_behaviors();
 
     // Helper function to initialize/reinitialize MoE executor
@@ -149,6 +148,9 @@ protected:
 
     FuncMemMgr m_func_mem_mgr;                       // Owns memory
     std::map<LinkFrom, TensorPtr> m_funcall_result;  // Provides a convenient link
+    // Function-call output -> top-level output. Uses the concrete call-site index,
+    // unlike FuncMemMgr's prototype index used to group reusable internal memory.
+    std::map<LinkFrom, std::size_t> m_external_funcall_outputs;
 
     bool is_pipelined(std::size_t idx) const;
     bool m_use_function_pipelining = false;

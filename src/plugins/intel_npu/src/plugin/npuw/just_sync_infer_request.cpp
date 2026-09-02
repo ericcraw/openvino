@@ -164,7 +164,7 @@ void ov::npuw::FuncMemMgr::set_alloc(AllocFcn&& fcn) {
     m_alloc = std::move(fcn);
 }
 
-void ov::npuw::FuncMemMgr::assign_memory() {
+void ov::npuw::FuncMemMgr::assign_memory(const std::map<LinkFrom, std::size_t>& external_outputs) {
     LOG_VERB("Assigning function memory...");
     LOG_BLOCK();
 
@@ -194,6 +194,12 @@ void ov::npuw::FuncMemMgr::assign_memory() {
             const auto num_outs = proto_comp_model_desc.compiled_model->outputs().size();
             for (std::size_t out_idx = 0u; out_idx < num_outs; out_idx++) {
                 const LinkFrom this_out = LinkFrom{idx, out_idx};
+                if (external_outputs.count(this_out)) {
+                    // Top-level output storage is authoritative. It is resolved lazily by
+                    // JustInferRequest immediately before inference and must never enter
+                    // the reusable function-memory pool.
+                    continue;
+                }
                 assign(this_out);
             }
         }
@@ -279,8 +285,26 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
     : IBaseInferRequest(compiled_model),
       m_func_mem_mgr(compiled_model) {
     using namespace std::placeholders;
+
+    for (std::size_t output_idx = 0; output_idx < m_npuw_model->outputs().size(); ++output_idx) {
+        const auto& from = m_npuw_model->m_outputs_to_submodels_outputs.at(output_idx);
+        if (from == CompiledModel::NO_LINK || !m_npuw_model->m_compiled_submodels.at(from.first).replaced_by) {
+            continue;
+        }
+
+        const auto inserted = m_external_funcall_outputs.emplace(from, output_idx).second;
+        NPUW_ASSERT(inserted && "A function-call output must map to only one top-level output");
+
+        const auto& port = m_npuw_model->outputs().at(output_idx);
+        LOG_DEBUG("Discovered external function output '"
+                  << port.get_any_name() << "' [" << output_idx << "] from Subgraph[" << from.first << "]/"
+                  << from.second << ", shape=" << port.get_shape() << ", type=" << port.get_element_type()
+                  << ", device=" << global_output_mem_device(output_idx)
+                  << ", bytes=" << ov::shape_size(port.get_shape()) * port.get_element_type().size());
+    }
+
     m_func_mem_mgr.set_alloc(std::bind(&JustInferRequest::allocMem, this, _1, _2, _3));
-    m_func_mem_mgr.assign_memory();
+    m_func_mem_mgr.assign_memory(m_external_funcall_outputs);
 
     m_closure_update_required = m_npuw_model->m_cfg.get<::intel_npu::NPUW_FOLD>();
     m_use_function_pipelining = m_npuw_model->m_cfg.get<::intel_npu::NPUW_FUNCALL_ASYNC>();
@@ -292,8 +316,8 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
 
     m_spatial_io.resize(m_num_submodels);
 
-    // Create infer requests
-    // Preallocate funcall tensors & substitute function call requests
+    // Create infer requests, initialize internal funcall tensors, and substitute
+    // function call requests. External funcall tensors stay unresolved until inference.
     bool has_spatial = false;
     bool has_moe = false;
     std::size_t moe_real_idx = -1;  // Track which real function has MoE
@@ -355,7 +379,9 @@ ov::npuw::JustInferRequest::JustInferRequest(const std::shared_ptr<ov::npuw::Com
 
             for (size_t out_idx = 0; out_idx < num_outputs; out_idx++) {
                 const auto from = LinkFrom{i, out_idx};
-                m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
+                if (!m_external_funcall_outputs.count(from)) {
+                    m_funcall_result[from] = m_func_mem_mgr.get_tensor(from);
+                }
             }
             if (real_idx != i) {
                 // If this function call is NOT the function body, do nothing here - the original
@@ -566,30 +592,17 @@ void ov::npuw::JustInferRequest::set_tensor(const ov::Output<const ov::Node>& po
     for (std::size_t i = 0; i < m_npuw_model->outputs().size(); ++i) {
         if (m_npuw_model->outputs()[i] == port) {
             const auto& from_submodel = m_npuw_model->m_outputs_to_submodels_outputs.at(i);
-            auto funcall_result_iter = m_funcall_result.find(from_submodel);
-            // This is a tricky case:
-            // 1) We already allocated an output tensor in m_funcall_result via FMM
-            // 2) We got an output tensor from outside
-            // m_funcall_result and m_port_to_tensor aren't connected, thus we will only write
-            // to m_funcall_result, but get_tensor() would return an empty tensor from m_port_to_tensor.
-            // Here we have to set the tensor to function's output, so the function will write to the correct tensor.
-            if (funcall_result_iter != m_funcall_result.end()) {
-                funcall_result_iter->second = tensor;
+            if (m_external_funcall_outputs.count(from_submodel)) {
+                // Keep the public output as the source of truth while making the
+                // concrete function call observe a newly supplied binding.
+                m_funcall_result[from_submodel] = tensor;
             }
+            break;
         }
     }
 
     // Process setting input tensor
     handle_set_remote_input(port, tensor);
-}
-
-ov::npuw::TensorPtr ov::npuw::JustInferRequest::alloc_global_out(std::size_t out_idx) const {
-    const auto& from_submodel = m_npuw_model->m_outputs_to_submodels_outputs.at(out_idx);
-    auto funcall_result_iter = m_funcall_result.find(from_submodel);
-    if (funcall_result_iter != m_funcall_result.end()) {
-        return funcall_result_iter->second;
-    }
-    return IBaseInferRequest::alloc_global_out(out_idx);
 }
 
 void ov::npuw::JustInferRequest::connect_subrequests() {
@@ -616,7 +629,14 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
             // A function call to normal subgraph connection:
             // - Take a tensor from the storage & assign it to the reader
             const auto& iport = m_subrequests[subm_idx_to]->get_compiled_model()->inputs()[port_idx_to];
-            const auto& tensor = m_funcall_result.at(LinkFrom{subm_idx_from, port_idx_from});
+            const LinkFrom from{subm_idx_from, port_idx_from};
+            const auto tensor_it = m_funcall_result.find(from);
+            if (tensor_it == m_funcall_result.end()) {
+                NPUW_ASSERT(m_external_funcall_outputs.count(from));
+                LOG_DEBUG("Defer connection until the external function output is resolved");
+                continue;
+            }
+            const auto& tensor = tensor_it->second;
             subreqs[subm_idx_to]->set_tensor(iport, tensor);
             LOG_DEBUG("Set Subgraph[" << subm_idx_to << "]/" << iport << " to internal tensor");
         } else if (!subm[subm_idx_from].replaced_by && subm[subm_idx_to].replaced_by) {
@@ -657,9 +677,51 @@ void ov::npuw::JustInferRequest::connect_subrequests() {
     LOG_INFO("Done");
 }
 
+void ov::npuw::JustInferRequest::resolve_external_function_outputs() {
+    if (m_external_funcall_outputs.empty()) {
+        return;
+    }
+
+    for (const auto& [from, output_idx] : m_external_funcall_outputs) {
+        const auto& port = m_npuw_model->outputs().at(output_idx);
+        const bool reused_binding = [&]() {
+            std::unique_lock lock(m_io_storages_mutex);
+            return is_stored(port);
+        }();
+        auto tensor = get_tensor(port);
+        m_funcall_result[from] = tensor;
+
+        LOG_DEBUG("Resolved external function output '"
+                  << port.get_any_name() << "' [" << output_idx << "] from Subgraph[" << from.first << "]/"
+                  << from.second << ", shape=" << tensor->get_shape() << ", type=" << tensor->get_element_type()
+                  << ", device=" << global_output_mem_device(output_idx) << ", bytes=" << tensor->get_byte_size()
+                  << ", storage=" << (reused_binding ? "existing binding" : "lazy allocation"));
+    }
+
+    // Function-to-function consumers bind at runtime in function_prologue().
+    // Refresh only function-to-regular consumers now that their producer storage exists.
+    for (const auto& [to, from] : m_npuw_model->m_submodels_input_to_prev_output) {
+        const auto tensor_it = m_funcall_result.find(from);
+        if (!m_external_funcall_outputs.count(from) || tensor_it == m_funcall_result.end() ||
+            m_npuw_model->m_compiled_submodels[to.first].replaced_by) {
+            continue;
+        }
+
+        auto& consumer = m_subrequests[to.first];
+        if (!consumer) {
+            LOG_WARN("External function output consumer Subgraph[" << to.first << "] was optimized out");
+            continue;
+        }
+        const auto& input_port = consumer->get_compiled_model()->inputs().at(to.second);
+        consumer->set_tensor(input_port, tensor_it->second);
+    }
+}
+
 void ov::npuw::JustInferRequest::prepare_for_infer() {
     LOG_DEBUG("Preparing to infer...");
     LOG_BLOCK();
+
+    resolve_external_function_outputs();
 
     // Adjust spatial input range, if supported
     if (m_spatial_selector) {
@@ -829,10 +891,8 @@ void ov::npuw::JustInferRequest::function_prologue(std::size_t idx) {
     }
 
     // 3. Tell the function which results to produce (this time).
-    // Note it covers both internal tensors used by other subgraphs as well as
-    // the Result tensors for the entire network.
-    // ..Since the tensors allocated for outputs of the networks ARE taken from the
-    // "funcall_results" if those are produced by funcall results.
+    // This covers both internal tensors used by other subgraphs and top-level
+    // result tensors resolved into m_funcall_result before inference.
     for (std::size_t i = 0; i < func_desc.compiled_model->outputs().size(); i++) {
         LOG_DEBUG("Binding result[" << i << "]...");
         auto& oport = func_desc.compiled_model->outputs()[i];
